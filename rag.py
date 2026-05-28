@@ -325,5 +325,3 @@ while True:
     print(f"Avg TTFT: {avg_ttft:.3f}s")
     print(f"Avg Latency: {avg_lat:.3f}s")
     print(f"Avg TPS: {avg_tps:.2f}")
-    print("[DEBUG] Total characters loaded:", len(raw_text))
-    print("[DEBUG] Sample:", raw_text[:300])
