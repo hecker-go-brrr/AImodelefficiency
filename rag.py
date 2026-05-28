@@ -1,30 +1,33 @@
 import os
 import time
+import re
 import psutil
 import chromadb
 import ollama
-
-from pypdf import PdfReader
+import pandas as pd
 from sentence_transformers import SentenceTransformer
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 
-DATA_FOLDER = "data"
+DATA_PATH = "data"  # 👈 LOCAL DATASET FOLDER
+
 DB_PATH = "chroma_db"
-COLLECTION_NAME = "docs"
+COLLECTION_NAME = "vivekananda_docs"
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL = "qwen2.5:7b"
 
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 120
-TOP_K = 3
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 300
+TOP_K = 8
 
 # -----------------------------
-# INIT
+# INIT MODELS + DB
 # -----------------------------
+
+print("\n[INFO] Initializing models...\n")
 
 embedder = SentenceTransformer(EMBED_MODEL)
 
@@ -32,74 +35,160 @@ client = chromadb.PersistentClient(path=DB_PATH)
 collection = client.get_or_create_collection(name=COLLECTION_NAME)
 
 # -----------------------------
-# PDF LOADER
+# LOAD TEXT FROM LOCAL DATA FOLDER
 # -----------------------------
 
-def load_pdfs(folder):
+def load_text(folder):
     text = ""
-    for file in os.listdir(folder):
-        if file.endswith(".pdf"):
-            path = os.path.join(folder, file)
-            reader = PdfReader(path)
 
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+    for root, _, files in os.walk(folder):
+        print("[DEBUG] Files found:", files)
+        for f in files:
+            path = os.path.join(root, f)
+
+            # ----------------------
+            # TXT FILES
+            # ----------------------
+            if f.endswith(".txt"):
+                with open(path, "r", encoding="utf-8", errors="ignore") as file:
+                    text += file.read() + "\n"
+
+            # ----------------------
+            # EXCEL FILES (NEW FIX)
+            # ----------------------
+            elif f.endswith(".xlsx"):
+                try:
+                    excel_file = pd.ExcelFile(path)
+
+                    for sheet in excel_file.sheet_names:
+                        df = excel_file.parse(sheet)
+
+                        # convert all cells to text
+                        for col in df.columns:
+                            text += " ".join(df[col].astype(str).fillna("")) + "\n"
+
+                except Exception as e:
+                    print(f"[WARN] Failed to read {f}: {e}")
+            # ----------------------
+            # CSV FILES
+            # ----------------------
+            elif f.endswith(".csv"):
+                try:
+                    df = pd.read_csv(path)
+
+                    for col in df.columns:
+                        text += " ".join(df[col].astype(str).fillna("")) + "\n"
+
+                except Exception as e:
+                    print(f"[WARN] Failed to read CSV {f}: {e}")
 
     return text
-
 # -----------------------------
-# IMPROVED CHUNKING
+# CHUNKING (SENTENCE SAFE)
 # -----------------------------
 
-def chunk_text(text, size=800, overlap=120):
+def chunk_text(text, chunk_size=1500, overlap=300):
+
+    paragraphs = text.split("\n\n")
+
     chunks = []
-    start = 0
+    current_chunk = ""
 
-    while start < len(text):
-        end = start + size
-        chunks.append(text[start:end])
-        start += size - overlap
+    for para in paragraphs:
+
+        para = para.strip()
+
+        if not para:
+            continue
+
+        # if paragraph fits
+        if len(current_chunk) + len(para) < chunk_size:
+            current_chunk += "\n\n" + para
+
+        else:
+            # save current chunk
+            chunks.append(current_chunk.strip())
+
+            # preserve overlap
+            overlap_text = current_chunk[-overlap:]
+
+            # start new chunk
+            current_chunk = overlap_text + "\n\n" + para
+
+    # add final chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
 
     return chunks
 
 # -----------------------------
-# INGESTION (RUN ONCE)
+# INGESTION (ONLY ON FIRST RUN)
 # -----------------------------
 
 if collection.count() == 0:
-    print("\n[INFO] Ingesting documents...\n")
+    print("\n[INFO] Building vector database from local data...\n")
 
-    raw_text = load_pdfs(DATA_FOLDER)
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError(
+            f"Data folder '{DATA_PATH}' not found. Please add dataset inside it."
+        )
 
-    print("[DEBUG] Sample text:")
-    print(raw_text[:500])
+    raw_text = load_text(DATA_PATH)
 
-    chunks = chunk_text(raw_text, CHUNK_SIZE, CHUNK_OVERLAP)
+    if len(raw_text.strip()) == 0:
+        raise ValueError("No text files found in data folder")
+
+    print("[DEBUG] Sample text:\n", raw_text[:400])
+
+    chunks = chunk_text(
+        raw_text,
+        CHUNK_SIZE,
+        CHUNK_OVERLAP
+    )
 
     print(f"[INFO] Total chunks: {len(chunks)}")
 
-    embeddings = embedder.encode(chunks).tolist()
+    print("[INFO] Generating embeddings (this may take time)...")
+
+    embeddings = embedder.encode(
+        chunks,
+        normalize_embeddings=True
+    ).tolist()
 
     ids = [f"chunk_{i}" for i in range(len(chunks))]
 
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings,
-        ids=ids
-    )
+    BATCH_SIZE = 5000
+
+    for i in range(0, len(chunks), BATCH_SIZE):
+
+        batch_docs = chunks[i:i+BATCH_SIZE]
+        batch_embeds = embeddings[i:i+BATCH_SIZE]
+        batch_ids = ids[i:i+BATCH_SIZE]
+
+        collection.add(
+            documents=batch_docs,
+            embeddings=batch_embeds,
+            ids=batch_ids
+        )
+
+        print(f"[INFO] Added batch {i // BATCH_SIZE + 1}")
 
     print("[DONE] Vector DB created.\n")
 
 else:
-    print("\n[INFO] Using existing vector DB\n")
+    print("\n[INFO] Using existing vector database\n")
+
+# -----------------------------
+# METRICS
+# -----------------------------
+
+metrics_log = []
+process = psutil.Process(os.getpid())
+psutil.cpu_percent(interval=None)
 
 # -----------------------------
 # QUERY LOOP
 # -----------------------------
-
-metrics_log = []
 
 while True:
 
@@ -111,50 +200,65 @@ while True:
     # -------------------------
     # RETRIEVAL
     # -------------------------
-    query_embedding = embedder.encode([query]).tolist()[0]
+
+    query_embedding = embedder.encode(
+        [query],
+        normalize_embeddings=True
+    ).tolist()[0]
 
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=TOP_K
     )
 
-    retrieved = results["documents"][0]
+    retrieved = results.get("documents", [[]])[0]
 
-    print("\n--- RETRIEVED CHUNKS ---")
+    if not retrieved:
+        retrieved = ["No relevant context found"]
+
+    print("\n--- RETRIEVED CONTEXT ---")
     for i, r in enumerate(retrieved):
-        print(f"\n[Chunk {i}]\n{r[:300]}")
+        print(f"\n[Chunk {i}]\n{r[:250]}")
 
     context = "\n\n".join(retrieved)
 
+    # -------------------------
+    # PROMPT
+    # -------------------------
 
     prompt = f"""
-    You are a precise QA assistant for technical documents.
+    You are a helpful RAG assistant.
 
-    INSTRUCTIONS:
-    - Use ONLY the context below
-    - If the answer is partially present, infer carefully from context
-    - Do NOT say "Not found" if related information exists
-    - If unsure, give best possible answer based on context
-    
+    Answer using the provided context.
+
+    Rules:
+    - Prefer concise answers
+    - Combine information across chunks
+    - If the answer is partially present, summarize it
+    - ONLY say 'Not found in provided documents'
+      if the context is completely unrelated
+
     Context:
     {context}
 
     Question:
     {query}
+
+    Answer:
     """
 
     # -------------------------
     # METRICS START
     # -------------------------
-    start = time.time()
+
+    start_time = time.time()
     first_token_time = None
     response = ""
 
-    ram_before = psutil.virtual_memory().used / 1e9
+    # -------------------------
+    # GENERATION (OLLAMA STREAM)
+    # -------------------------
 
-    # -------------------------
-    # GENERATION (STREAM)
-    # -------------------------
     stream = ollama.chat(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -171,25 +275,26 @@ while True:
         response += token
         print(token, end="", flush=True)
 
-    end = time.time()
+    end_time = time.time()
 
     # -------------------------
     # METRICS CALCULATION
     # -------------------------
-    ttft = first_token_time - start
-    latency = end - start
+
+    ttft = max(0, (first_token_time or end_time) - start_time)
+    latency = end_time - start_time
 
     token_count = len(response.split())
-    tokens_per_sec = token_count / (latency - ttft + 1e-6)
+    tokens_per_sec = token_count / (latency + 1e-6)
 
-    ram_after = psutil.virtual_memory().used / 1e9
+    ram = process.memory_info().rss / 1e9
     cpu = psutil.cpu_percent(interval=0.5)
 
     metrics = {
         "ttft": ttft,
         "latency": latency,
         "tps": tokens_per_sec,
-        "ram": ram_after,
+        "ram": ram,
         "cpu": cpu
     }
 
@@ -198,16 +303,18 @@ while True:
     # -------------------------
     # PRINT METRICS
     # -------------------------
+
     print("\n\n--- METRICS (THIS QUERY) ---")
     print(f"TTFT: {ttft:.3f}s")
     print(f"Latency: {latency:.3f}s")
     print(f"Tokens/sec: {tokens_per_sec:.2f}")
-    print(f"RAM: {ram_after:.2f} GB")
+    print(f"RAM (process): {ram:.2f} GB")
     print(f"CPU: {cpu:.1f}%")
 
     # -------------------------
     # AVERAGE LAST 10
     # -------------------------
+
     recent = metrics_log[-10:]
 
     avg_ttft = sum(m["ttft"] for m in recent) / len(recent)
@@ -218,3 +325,5 @@ while True:
     print(f"Avg TTFT: {avg_ttft:.3f}s")
     print(f"Avg Latency: {avg_lat:.3f}s")
     print(f"Avg TPS: {avg_tps:.2f}")
+    print("[DEBUG] Total characters loaded:", len(raw_text))
+    print("[DEBUG] Sample:", raw_text[:300])
