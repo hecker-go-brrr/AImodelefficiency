@@ -1,0 +1,1 @@
+pip install chromadb ollama sentence-transformers pandas psutil openpyxl pypdf
